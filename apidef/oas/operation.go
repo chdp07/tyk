@@ -1,8 +1,8 @@
 package oas
 
 import (
-	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/TykTechnologies/tyk/apidef"
@@ -17,9 +17,12 @@ type Operation struct {
 	IgnoreAuthentication *Allowance `bson:"ignoreAuthentication,omitempty" json:"ignoreAuthentication,omitempty"`
 	// TransformRequestMethod allows you to transform the method of a request.
 	TransformRequestMethod *TransformRequestMethod `bson:"transformRequestMethod,omitempty" json:"transformRequestMethod,omitempty"`
-	Cache                  *CachePlugin            `bson:"cache,omitempty" json:"cache,omitempty"`
-	EnforceTimeout         *EnforceTimeout         `bson:"enforceTimeout,omitempty" json:"enforceTimeout,omitempty"`
-	ValidateRequest        *ValidateRequest        `bson:"validateRequest,omitempty" json:"validateRequest,omitempty"`
+	// TransformRequestBody allows you to transform request body.
+	// When both `path` and `body` are provided, body would take precedence.
+	TransformRequestBody *TransformRequestBody `bson:"transformRequestBody,omitempty" json:"transformRequestBody,omitempty"`
+	Cache                *CachePlugin          `bson:"cache,omitempty" json:"cache,omitempty"`
+	EnforceTimeout       *EnforceTimeout       `bson:"enforceTimeout,omitempty" json:"enforceTimeout,omitempty"`
+	ValidateRequest      *ValidateRequest      `bson:"validateRequest,omitempty" json:"validateRequest,omitempty"`
 }
 
 const (
@@ -29,9 +32,42 @@ const (
 	contentTypeJSON                    = "application/json"
 )
 
+func (o *Operation) Import(oasOperation *openapi3.Operation, allowList, validateRequest *bool) {
+	if allowList != nil {
+		allow := o.Allow
+		if allow == nil {
+			allow = &Allowance{}
+		}
+
+		allow.Import(*allowList)
+
+		if block := o.Block; block != nil && block.Enabled && *allowList {
+			block.Enabled = false
+		}
+
+		o.Allow = allow
+	}
+
+	if validateRequest != nil {
+		validate := o.ValidateRequest
+		if validate == nil {
+			validate = &ValidateRequest{}
+		}
+
+		if shouldImport := validate.shouldImportValidateRequest(oasOperation); !shouldImport {
+			return
+		}
+
+		validate.Import(*validateRequest)
+		o.ValidateRequest = validate
+	}
+}
+
 type AllowanceType int
 
 func (s *OAS) fillPathsAndOperations(ep apidef.ExtendedPathsSet) {
+	// Regardless if `ep` is a zero value, we need a non-nil paths
+	// to produce a valid OAS document
 	if s.Paths == nil {
 		s.Paths = make(openapi3.Paths)
 	}
@@ -40,13 +76,10 @@ func (s *OAS) fillPathsAndOperations(ep apidef.ExtendedPathsSet) {
 	s.fillAllowance(ep.BlackList, block)
 	s.fillAllowance(ep.Ignored, ignoreAuthentication)
 	s.fillTransformRequestMethod(ep.MethodTransforms)
+	s.fillTransformRequestBody(ep.Transform)
 	s.fillCache(ep.AdvanceCacheConfig)
 	s.fillEnforceTimeout(ep.HardTimeouts)
-	s.fillValidateRequest(ep.ValidateJSON)
-
-	if len(s.Paths) == 0 {
-		s.Paths = nil
-	}
+	s.fillOASValidateRequest(ep.ValidateRequest)
 }
 
 func (s *OAS) extractPathsAndOperations(ep *apidef.ExtendedPathsSet) {
@@ -64,9 +97,10 @@ func (s *OAS) extractPathsAndOperations(ep *apidef.ExtendedPathsSet) {
 					tykOp.extractAllowanceTo(ep, path, method, block)
 					tykOp.extractAllowanceTo(ep, path, method, ignoreAuthentication)
 					tykOp.extractTransformRequestMethodTo(ep, path, method)
+					tykOp.extractTransformRequestBodyTo(ep, path, method)
 					tykOp.extractCacheTo(ep, path, method)
 					tykOp.extractEnforceTimeoutTo(ep, path, method)
-					tykOp.extractValidateRequestTo(ep, path, method, operation, &s.Components)
+					tykOp.extractOASValidateRequestTo(ep, path, method)
 					break found
 				}
 			}
@@ -116,6 +150,22 @@ func (s *OAS) fillTransformRequestMethod(metas []apidef.MethodTransformMeta) {
 		operation.TransformRequestMethod.Fill(meta)
 		if ShouldOmit(operation.TransformRequestMethod) {
 			operation.TransformRequestMethod = nil
+		}
+	}
+}
+
+func (s *OAS) fillTransformRequestBody(metas []apidef.TemplateMeta) {
+	for _, meta := range metas {
+		operationID := s.getOperationID(meta.Path, meta.Method)
+		operation := s.GetTykExtension().getOperation(operationID)
+
+		if operation.TransformRequestBody == nil {
+			operation.TransformRequestBody = &TransformRequestBody{}
+		}
+
+		operation.TransformRequestBody.Fill(meta)
+		if ShouldOmit(operation.TransformRequestBody) {
+			operation.TransformRequestBody = nil
 		}
 	}
 }
@@ -182,6 +232,16 @@ func (o *Operation) extractTransformRequestMethodTo(ep *apidef.ExtendedPathsSet,
 	ep.MethodTransforms = append(ep.MethodTransforms, meta)
 }
 
+func (o *Operation) extractTransformRequestBodyTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.TransformRequestBody == nil {
+		return
+	}
+
+	meta := apidef.TemplateMeta{Path: path, Method: method}
+	o.TransformRequestBody.ExtractTo(&meta)
+	ep.Transform = append(ep.Transform, meta)
+}
+
 func (o *Operation) extractCacheTo(ep *apidef.ExtendedPathsSet, path string, method string) {
 	if o.Cache == nil {
 		return
@@ -203,6 +263,16 @@ func (o *Operation) extractEnforceTimeoutTo(ep *apidef.ExtendedPathsSet, path st
 	meta := apidef.HardTimeoutMeta{Path: path, Method: method}
 	o.EnforceTimeout.ExtractTo(&meta)
 	ep.HardTimeouts = append(ep.HardTimeouts, meta)
+}
+
+func (o *Operation) extractOASValidateRequestTo(ep *apidef.ExtendedPathsSet, path string, method string) {
+	if o.ValidateRequest == nil {
+		return
+	}
+
+	meta := apidef.ValidateRequestMeta{Path: path, Method: method}
+	o.ValidateRequest.ExtractTo(&meta)
+	ep.ValidateRequest = append(ep.ValidateRequest, meta)
 }
 
 // detect possible regex pattern:
@@ -354,17 +424,55 @@ type ValidateRequest struct {
 	ErrorResponseCode int  `bson:"errorResponseCode,omitempty" json:"errorResponseCode,omitempty"`
 }
 
-func (v *ValidateRequest) Fill(meta apidef.ValidatePathMeta) {
-	v.Enabled = !meta.Disabled
+func (v *ValidateRequest) Fill(meta apidef.ValidateRequestMeta) {
+	v.Enabled = meta.Enabled
 	v.ErrorResponseCode = meta.ErrorResponseCode
 }
 
-func (v *ValidateRequest) ExtractTo(meta *apidef.ValidatePathMeta) {
-	meta.Disabled = !v.Enabled
+func (v *ValidateRequest) ExtractTo(meta *apidef.ValidateRequestMeta) {
+	meta.Enabled = v.Enabled
 	meta.ErrorResponseCode = v.ErrorResponseCode
 }
 
-func (s *OAS) fillValidateRequest(metas []apidef.ValidatePathMeta) {
+func (v *ValidateRequest) shouldImportValidateRequest(operation *openapi3.Operation) bool {
+	reqBody := operation.RequestBody
+	if reqBody == nil {
+		return false
+	}
+
+	reqBodyVal := reqBody.Value
+	if reqBodyVal == nil {
+		return false
+	}
+
+	media := reqBodyVal.Content.Get("application/json")
+
+	return media != nil
+}
+
+func (v *ValidateRequest) Import(enabled bool) {
+	v.Enabled = enabled
+	v.ErrorResponseCode = http.StatusUnprocessableEntity
+}
+
+func (s *OAS) fillOASValidateRequest(metas []apidef.ValidateRequestMeta) {
+	for _, meta := range metas {
+		operationID := s.getOperationID(meta.Path, meta.Method)
+		tykOp := s.GetTykExtension().getOperation(operationID)
+
+		if tykOp.ValidateRequest == nil {
+			tykOp.ValidateRequest = &ValidateRequest{}
+		}
+
+		tykOp.ValidateRequest.Fill(meta)
+
+		if ShouldOmit(tykOp.ValidateRequest) {
+			tykOp.ValidateRequest = nil
+		}
+	}
+}
+
+/*func (s *OAS) fillValidateRequest(metas []apidef.ValidatePathMeta) {
 	for _, meta := range metas {
 		operationID := s.getOperationID(meta.Path, meta.Method)
 		tykOp := s.GetTykExtension().getOperation(operationID)
@@ -489,3 +597,4 @@ func (o *Operation) extractValidateRequestTo(ep *apidef.ExtendedPathsSet, path s
 		log.WithError(err).Error("Path meta schema couldn't be unmarshalled")
 	}
 }
+*/

@@ -1,9 +1,6 @@
 package oas
 
 import (
-	"sort"
-	"strings"
-
 	"github.com/TykTechnologies/tyk/apidef"
 )
 
@@ -22,7 +19,7 @@ type Server struct {
 	GatewayTags *GatewayTags `bson:"gatewayTags,omitempty" json:"gatewayTags,omitempty"`
 	// CustomDomain is the domain to bind this API to.
 	// Old API Definition: `domain`
-	CustomDomain string `bson:"customDomain,omitempty" json:"customDomain,omitempty"`
+	CustomDomain *Domain `bson:"customDomain,omitempty" json:"customDomain,omitempty"`
 }
 
 func (s *Server) Fill(api apidef.APIDefinition) {
@@ -46,7 +43,9 @@ func (s *Server) Fill(api apidef.APIDefinition) {
 		s.GatewayTags = nil
 	}
 
-	s.CustomDomain = api.Domain
+	if s.CustomDomain != nil {
+		s.CustomDomain.Fill(api)
+	}
 }
 
 func (s *Server) ExtractTo(api *apidef.APIDefinition) {
@@ -58,9 +57,13 @@ func (s *Server) ExtractTo(api *apidef.APIDefinition) {
 	}
 	if s.GatewayTags != nil {
 		s.GatewayTags.ExtractTo(api)
+	} else {
+		api.TagsDisabled = true
+		api.Tags = []string{}
 	}
-
-	api.Domain = s.CustomDomain
+	if s.CustomDomain != nil {
+		s.CustomDomain.ExtractTo(api)
+	}
 }
 
 type ListenPath struct {
@@ -86,7 +89,7 @@ func (lp *ListenPath) ExtractTo(api *apidef.APIDefinition) {
 
 type ClientCertificates struct {
 	// Enabled enables static mTLS for the API.
-	Enabled bool `bson:"enabled,omitempty" json:"enabled,omitempty"`
+	Enabled bool `bson:"enabled" json:"enabled"`
 	// AllowList is the list of client certificates which are allowed.
 	Allowlist []string `bson:"allowlist" json:"allowlist"`
 }
@@ -103,71 +106,45 @@ func (cc *ClientCertificates) ExtractTo(api *apidef.APIDefinition) {
 
 type GatewayTags struct {
 	// Enabled enables use of segment tags.
-	Enabled bool `bson:"enabled,omitempty" json:"enabled,omitempty"`
+	Enabled bool `bson:"enabled" json:"enabled"`
 	// Tags is a list of segment tags
 	Tags []string `bson:"tags" json:"tags"`
 }
 
 func (gt *GatewayTags) Fill(api apidef.APIDefinition) {
-	gt.Enabled = api.EnableTags
+	gt.Enabled = !api.TagsDisabled
 	gt.Tags = api.Tags
+	if gt.Tags == nil {
+		gt.Tags = []string{}
+	}
 }
 
 func (gt *GatewayTags) ExtractTo(api *apidef.APIDefinition) {
-	api.EnableTags = gt.Enabled
+	api.TagsDisabled = !gt.Enabled
 	api.Tags = gt.Tags
 }
 
-type Certificate struct {
-	Domain string `bson:"domain" json:"domain"`
-	Cert   string `bson:"certificate" json:"certificate"`
+type Domain struct {
+	// Enabled allow/disallow the usage of the domain.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Name is the name of the domain.
+	Name string `bson:"name" json:"name"`
 }
 
-type Certificates []Certificate
-
-func (c Certificates) Fill(upstreamCerts map[string]string) {
-	i := 0
-	for domain, cert := range upstreamCerts {
-		c[i] = Certificate{Domain: domain, Cert: cert}
-		i++
+func (cd *Domain) ExtractTo(api *apidef.APIDefinition) {
+	if !cd.Enabled && cd.Name == "" {
+		// nothing was configured
+		return
 	}
+	api.DomainDisabled = !cd.Enabled
+	api.Domain = cd.Name
 }
 
-func (c Certificates) ExtractTo(upstreamCerts map[string]string) {
-	for _, cert := range c {
-		upstreamCerts[cert.Domain] = cert.Cert
+func (cd *Domain) Fill(api apidef.APIDefinition) {
+	if !api.DomainDisabled && api.Domain == "" {
+		// nothing was configured.
+		return
 	}
-}
-
-type PinnedPublicKey struct {
-	Domain string   `bson:"domain" json:"domain"`
-	List   []string `bson:"list" json:"list"`
-}
-
-type PinnedPublicKeys []PinnedPublicKey
-
-func (ppk PinnedPublicKeys) Fill(publicKeys map[string]string) {
-	domains := make([]string, len(publicKeys))
-
-	i := 0
-	for domain := range publicKeys {
-		domains[i] = domain
-		i++
-	}
-
-	sort.Slice(domains, func(i, j int) bool {
-		return domains[i] < domains[j]
-	})
-
-	i = 0
-	for _, domain := range domains {
-		ppk[i] = PinnedPublicKey{Domain: domain, List: strings.Split(strings.ReplaceAll(publicKeys[domain], " ", ""), ",")}
-		i++
-	}
-}
-
-func (ppk PinnedPublicKeys) ExtractTo(publicKeys map[string]string) {
-	for _, publicKey := range ppk {
-		publicKeys[publicKey.Domain] = strings.Join(publicKey.List, ",")
-	}
+	cd.Enabled = !api.DomainDisabled
+	cd.Name = api.Domain
 }

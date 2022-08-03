@@ -503,6 +503,10 @@ func (a *Allowance) ExtractTo(endpointMeta *apidef.EndPointMeta) {
 	endpointMeta.IgnoreCase = a.IgnoreCase
 }
 
+func (a *Allowance) Import(enabled bool) {
+	a.Enabled = enabled
+}
+
 type MockResponse struct {
 	// Enabled enables Mock response in the given path and method.
 	Enabled bool `bson:"enabled" json:"enabled"`
@@ -566,6 +570,40 @@ func (tm *TransformRequestMethod) Fill(meta apidef.MethodTransformMeta) {
 func (tm *TransformRequestMethod) ExtractTo(meta *apidef.MethodTransformMeta) {
 	meta.Disabled = !tm.Enabled
 	meta.ToMethod = tm.ToMethod
+}
+
+type TransformRequestBody struct {
+	// Enabled enables transform request body middleware.
+	Enabled bool `bson:"enabled" json:"enabled"`
+	// Format of the request body, xml or json.
+	Format apidef.RequestInputType `bson:"format" json:"format"`
+	// Path file path for the template.
+	Path string `bson:"path" json:"path"`
+	// Body base64 encoded representation of the template.
+	Body string `bson:"body" json:"body"`
+}
+
+func (tr *TransformRequestBody) Fill(meta apidef.TemplateMeta) {
+	tr.Enabled = !meta.Disabled
+	tr.Format = meta.TemplateData.Input
+	if meta.TemplateData.Mode == apidef.UseBlob {
+		tr.Body = meta.TemplateData.TemplateSource
+	} else {
+		tr.Path = meta.TemplateData.TemplateSource
+	}
+}
+
+func (tr *TransformRequestBody) ExtractTo(meta *apidef.TemplateMeta) {
+	meta.Disabled = !tr.Enabled
+	meta.TemplateData.Input = tr.Format
+	meta.TemplateData.EnableSession = true
+	if tr.Body != "" {
+		meta.TemplateData.Mode = apidef.UseBlob
+		meta.TemplateData.TemplateSource = tr.Body
+	} else {
+		meta.TemplateData.Mode = apidef.UseFile
+		meta.TemplateData.TemplateSource = tr.Path
+	}
 }
 
 type CachePlugin struct {

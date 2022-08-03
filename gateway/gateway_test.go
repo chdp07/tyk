@@ -442,6 +442,45 @@ func TestListener(t *testing.T) {
 	ts.RunExt(t, tests...)
 }
 
+func TestListenerWithStrictRoutes(t *testing.T) {
+	ts := StartTest(func(globalConf *config.Config) {
+		globalConf.HttpServerOptions.EnableStrictRoutes = true
+	})
+	defer ts.Close()
+
+	ts.Gw.ReloadTestCase.Enable()
+	defer ts.Gw.ReloadTestCase.Disable()
+
+	ts.Gw.ReloadTestCase.StartTicker()
+	defer ts.Gw.ReloadTestCase.StopTicker()
+	tests := []test.TestCase{
+		// Cleanup before tests
+		{Method: "DELETE", Path: "/tyk/apis/test", AdminAuth: true},
+		{Method: "GET", Path: "/tyk/reload/?block=true", AdminAuth: true, Code: 200},
+
+		{Method: "GET", Path: "/sample", Code: 404},
+		{Method: "GET", Path: "/tyk/apis/", Code: 403},
+		{Method: "GET", Path: "/tyk/apis/", AdminAuth: true, Code: 200, BodyMatch: `\[\]`},
+		{Method: "GET", Path: "/tyk/apis", Code: 403},
+		{Method: "GET", Path: "/tyk/apis", AdminAuth: true, Code: 200},
+		{Method: "POST", Path: "/tyk/apis", Data: sampleAPI, AdminAuth: true, Code: 200},
+		{Method: "GET", Path: "/tyk/apis/", AdminAuth: true, Code: 200, BodyMatch: `\[\]`},
+		{Method: "POST", Path: "/tyk/apis/mismatch", AdminAuth: true, Code: 400},
+		{Method: "GET", Path: "/tyk/apis/test", AdminAuth: true, Code: 404},
+		// API definitions not reloaded yet
+		{Method: "GET", Path: "/sample", Code: 404},
+		{Method: "GET", Path: "/tyk/reload/?block=true", AdminAuth: true, Code: 200},
+		{Method: "GET", Path: "/tyk/apis/test", AdminAuth: true, Code: 200, BodyMatch: `^{.*"api_id":"test".*}`},
+		{Method: "GET", Path: "/tyk/apis/", AdminAuth: true, Code: 200, BodyMatch: `^\[.*"api_id":"test".*\]`},
+		{Method: "GET", Path: "/sample", Code: 200},
+		{Method: "GET", Path: "/samplefoo", Code: 404},
+		{Method: "GET", Path: "/sample/", Code: 200},
+		{Method: "GET", Path: "/sample/foo", Code: 200},
+	}
+
+	ts.RunExt(t, tests...)
+}
+
 // Admin api located on separate port
 func TestControlListener(t *testing.T) {
 	ts := StartTest(nil, TestConfig{
@@ -1691,44 +1730,6 @@ func TestBrokenClients(t *testing.T) {
 			t.Fatal("Analytics record do not match:", record)
 		}
 	})
-}
-
-func TestStripRegex(t *testing.T) {
-	sample := []struct {
-		strip  string
-		path   string
-		expect string
-		vars   map[string]string
-	}{
-		{
-			strip:  "/base",
-			path:   "/base/path",
-			expect: "/path",
-			vars:   map[string]string{},
-		},
-		{
-			strip:  "/base/{key}",
-			path:   "/base/path/path",
-			expect: "/path",
-			vars: map[string]string{
-				"key": "path",
-			},
-		},
-		{
-			strip:  "/taihoe-test/{test:[\\w\\d]+}/id/",
-			path:   "/taihoe-test/asdas234234dad/id/v1/get",
-			expect: "/v1/get",
-			vars: map[string]string{
-				"test": "asdas234234dad",
-			},
-		},
-	}
-	for _, v := range sample {
-		got := stripListenPath(v.strip, v.path, v.vars)
-		if got != v.expect {
-			t.Errorf("expected %s got %s", v.expect, got)
-		}
-	}
 }
 
 func TestCache_singleErrorResponse(t *testing.T) {

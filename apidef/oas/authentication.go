@@ -1,7 +1,10 @@
 package oas
 
 import (
+	"fmt"
 	"sort"
+
+	"github.com/getkin/kin-openapi/openapi3"
 
 	"github.com/TykTechnologies/tyk/apidef"
 )
@@ -34,8 +37,8 @@ type Authentication struct {
 	GoPlugin *GoPlugin `bson:"goPlugin,omitempty" json:"goPlugin,omitempty"`
 	// CustomPlugin contains the configurations related to CustomPlugin authentication mode.
 	// Old API Definition: `auth_configs["coprocess"]`
-	CustomPlugin    *CustomPlugin          `bson:"customPlugin,omitempty" json:"customPlugin,omitempty"`
-	SecuritySchemes map[string]interface{} `bson:"securitySchemes,omitempty" json:"securitySchemes,omitempty"`
+	CustomPlugin    *CustomPlugin   `bson:"customPlugin,omitempty" json:"customPlugin,omitempty"`
+	SecuritySchemes SecuritySchemes `bson:"securitySchemes,omitempty" json:"securitySchemes,omitempty"`
 }
 
 func (a *Authentication) Fill(api apidef.APIDefinition) {
@@ -115,6 +118,112 @@ func (a *Authentication) ExtractTo(api *apidef.APIDefinition) {
 	if a.CustomPlugin != nil {
 		a.CustomPlugin.ExtractTo(api)
 	}
+}
+
+type SecuritySchemes map[string]interface{}
+
+type SecurityScheme interface {
+	Import(nativeSS *openapi3.SecurityScheme, enable bool)
+}
+
+func (ss SecuritySchemes) Import(name string, nativeSS *openapi3.SecurityScheme, enable bool) error {
+	switch {
+	case nativeSS.Type == typeApiKey:
+		token := &Token{}
+		if ss[name] == nil {
+			ss[name] = token
+		} else {
+			if tokenVal, ok := ss[name].(*Token); ok {
+				token = tokenVal
+			} else {
+				toStructIfMap(ss[name], token)
+			}
+		}
+
+		token.Import(nativeSS, enable)
+	case nativeSS.Type == typeHttp && nativeSS.Scheme == schemeBearer && nativeSS.BearerFormat == bearerFormatJWT:
+		jwt := &JWT{}
+		if ss[name] == nil {
+			ss[name] = jwt
+		} else {
+			if jwtVal, ok := ss[name].(*JWT); ok {
+				jwt = jwtVal
+			} else {
+				toStructIfMap(ss[name], jwt)
+			}
+		}
+
+		jwt.Import(enable)
+	case nativeSS.Type == typeHttp && nativeSS.Scheme == schemeBasic:
+		basic := &Basic{}
+		if ss[name] == nil {
+			ss[name] = basic
+		} else {
+			if basicVal, ok := ss[name].(*Basic); ok {
+				basic = basicVal
+			} else {
+				toStructIfMap(ss[name], basic)
+			}
+		}
+
+		basic.Import(enable)
+	case nativeSS.Type == typeOAuth2:
+		oauth := &OAuth{}
+		if ss[name] == nil {
+			ss[name] = oauth
+		} else {
+			if oauthVal, ok := ss[name].(*OAuth); ok {
+				oauth = oauthVal
+			} else {
+				toStructIfMap(ss[name], oauth)
+			}
+		}
+
+		oauth.Import(enable)
+	default:
+		return fmt.Errorf(unsupportedSecuritySchemeFmt, name)
+	}
+
+	return nil
+}
+
+func baseIdentityProviderPrecedence(authType apidef.AuthTypeEnum) int {
+	switch authType {
+	case apidef.AuthToken:
+		return 1
+	case apidef.JWTClaim:
+		return 2
+	case apidef.OAuthKey:
+		return 3
+	case apidef.BasicAuthUser:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func (ss SecuritySchemes) GetBaseIdentityProvider() (res apidef.AuthTypeEnum) {
+	if len(ss) < 2 {
+		return
+	}
+
+	resBaseIdentityProvider := baseIdentityProviderPrecedence(apidef.AuthTypeNone)
+	res = apidef.OAuthKey
+
+	for _, scheme := range ss {
+		if _, ok := scheme.(*Token); ok {
+			return apidef.AuthToken
+		}
+
+		if _, ok := scheme.(*JWT); ok {
+			if baseIdentityProviderPrecedence(apidef.JWTClaim) < resBaseIdentityProvider {
+				resBaseIdentityProvider = baseIdentityProviderPrecedence(apidef.JWTClaim)
+				res = apidef.JWTClaim
+			}
+		}
+	}
+
+	return
 }
 
 type AuthSources struct {

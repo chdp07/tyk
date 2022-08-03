@@ -335,6 +335,15 @@ type LocalSessionCacheConf struct {
 	CachedSessionTimeout int `json:"cached_session_timeout"`
 	CacheSessionEviction int `json:"cached_session_eviction"`
 }
+type CertsData []CertData
+
+func (certs *CertsData) Decode(value string) error {
+	err := json.Unmarshal([]byte(value), certs)
+	if err != nil {
+		log.Error("Error unmarshaling TYK_GW_HTTPSERVEROPTIONS_CERTIFICATES")
+	}
+	return nil
+}
 
 type HttpServerOptionsConfig struct {
 	// No longer used
@@ -355,6 +364,14 @@ type HttpServerOptionsConfig struct {
 	// Enable HTTP2 protocol handling
 	EnableHttp2 bool `json:"enable_http2"`
 
+	// EnableStrictRoutes changes the routing to avoid nearest-neighbour requests on overlapping routes
+	//
+	// - if disabled, `/apple` will route to `/app`, the current default behavior,
+	// - if enabled, `/app` only responds to `/app`, `/app/` and `/app/*` but not `/apple`
+	//
+	// Regular expressions and parameterized routes will be left alone regardless of this setting.
+	EnableStrictRoutes bool `json:"enable_strict_routes"`
+
 	// Disable TLS verification. Required if you are using self-signed certificates.
 	SSLInsecureSkipVerify bool `json:"ssl_insecure_skip_verify"`
 
@@ -362,7 +379,7 @@ type HttpServerOptionsConfig struct {
 	EnableWebSockets bool `json:"enable_websockets"`
 
 	// Deprecated. SSL certificates used by Gateway server.
-	Certificates []CertData `json:"certificates"`
+	Certificates CertsData `json:"certificates"`
 
 	// SSL certificates used by your Gateway server. A list of certificate IDs or path to files.
 	SSLCertificates []string `json:"ssl_certificates"`
@@ -579,8 +596,12 @@ type Config struct {
 	// Enable Key hashing
 	HashKeys bool `json:"hash_keys"`
 
-	// Specify the Key hashing algorithm. Possible values: murmur64, murmur128, sha256
+	// Specify the Key hashing algorithm. Possible values: murmur64, murmur128, sha256.
 	HashKeyFunction string `json:"hash_key_function"`
+
+	// Specify the Key hashing algorithm for "basic auth". Possible values: murmur64, murmur128, sha256, bcrypt.
+	// Will default to "bcrypt" if not set.
+	BasicAuthHashKeyFunction string `json:"basic_auth_hash_key_function"`
 
 	// Specify your previous key hashing algorithm if you migrated from one algorithm to another.
 	HashKeyFunctionFallback []string `json:"hash_key_function_fallback"`
@@ -931,6 +952,8 @@ type Config struct {
 
 	// Enable global API token expiration. Can be needed if all your APIs using JWT or oAuth 2.0 auth methods with dynamically generated keys.
 	ForceGlobalSessionLifetime bool `bson:"force_global_session_lifetime" json:"force_global_session_lifetime"`
+	// SessionLifetimeRespectsKeyExpiration respects the key expiration time when the session lifetime is less than the key expiration. That is, Redis waits the key expiration for physical removal.
+	SessionLifetimeRespectsKeyExpiration bool `bson:"session_lifetime_respects_key_expiration" json:"session_lifetime_respects_key_expiration"`
 	// global session lifetime, in seconds.
 	GlobalSessionLifetime int64 `bson:"global_session_lifetime" json:"global_session_lifetime"`
 

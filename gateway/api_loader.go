@@ -81,9 +81,10 @@ func countApisByListenHash(specs []*APISpec) map[string]int {
 	count := make(map[string]int, len(specs))
 	// We must track the hostname no matter what
 	for _, spec := range specs {
-		domainHash := generateDomainPath(spec.Domain, spec.Proxy.ListenPath)
+		domain := spec.GetAPIDomain()
+		domainHash := generateDomainPath(domain, spec.Proxy.ListenPath)
 		if count[domainHash] == 0 {
-			dN := spec.Domain
+			dN := domain
 			if dN == "" {
 				dN = "(no host)"
 			}
@@ -151,7 +152,8 @@ func (gw *Gateway) processSpec(spec *APISpec, apisByListen map[string]int,
 
 	pathModified := false
 	for {
-		hash := generateDomainPath(spec.Domain, spec.Proxy.ListenPath)
+		domain := spec.GetAPIDomain()
+		hash := generateDomainPath(domain, spec.Proxy.ListenPath)
 
 		if apisByListen[hash] < 2 {
 			// not a duplicate
@@ -428,6 +430,7 @@ func (gw *Gateway) processSpec(spec *APISpec, apisByListen map[string]int,
 	}
 
 	gw.mwAppendEnabled(&chainArray, &ValidateJSON{BaseMiddleware: baseMid})
+	gw.mwAppendEnabled(&chainArray, &ValidateRequest{BaseMiddleware: baseMid})
 	gw.mwAppendEnabled(&chainArray, &TransformMiddleware{baseMid})
 	gw.mwAppendEnabled(&chainArray, &TransformJQMiddleware{baseMid})
 	gw.mwAppendEnabled(&chainArray, &TransformHeaders{BaseMiddleware: baseMid})
@@ -661,21 +664,61 @@ func (gw *Gateway) fuzzyFindAPI(search string) *APISpec {
 	return nil
 }
 
+type explicitRouteHandler struct {
+	prefix  string
+	handler http.Handler
+	muxer   *proxyMux
+}
+
+func (h *explicitRouteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == h.prefix || strings.HasPrefix(r.URL.Path, h.prefix+"/") {
+		h.handler.ServeHTTP(w, r)
+		return
+	}
+	h.muxer.handle404(w, r)
+}
+
+func explicitRouteSubpaths(prefix string, handler http.Handler, muxer *proxyMux, enabled bool) http.Handler {
+	// feature is enabled via config option
+	if !enabled {
+		return handler
+	}
+
+	// keep trailing slash paths as-is
+	if strings.HasSuffix(prefix, "/") {
+		return handler
+	}
+	// keep paths with params as-is
+	if strings.Contains(prefix, "{") && strings.Contains(prefix, "}") {
+		return handler
+	}
+
+	return &explicitRouteHandler{
+		prefix:  prefix,
+		handler: handler,
+		muxer:   muxer,
+	}
+}
+
+// loadHTTPService has two responsibilities:
+//
+// - register gorilla/mux routing handless with proxyMux directly (wrapped),
+// - return a raw http.Handler for tyk://ID urls.
 func (gw *Gateway) loadHTTPService(spec *APISpec, apisByListen map[string]int, gs *generalStores, muxer *proxyMux) http.Handler {
 	gwConfig := gw.GetConfig()
 	port := gwConfig.ListenPort
 	if spec.ListenPort != 0 {
 		port = spec.ListenPort
 	}
-	router := muxer.router(port, spec.Protocol, gw.GetConfig())
+	router := muxer.router(port, spec.Protocol, gwConfig)
 	if router == nil {
 		router = mux.NewRouter()
-		muxer.setRouter(port, spec.Protocol, router, gw.GetConfig())
+		muxer.setRouter(port, spec.Protocol, router, gwConfig)
 	}
 
 	hostname := gwConfig.HostName
 	if gwConfig.EnableCustomDomains && spec.Domain != "" {
-		hostname = spec.Domain
+		hostname = spec.GetAPIDomain()
 	}
 
 	if hostname != "" {
@@ -684,6 +727,7 @@ func (gw *Gateway) loadHTTPService(spec *APISpec, apisByListen map[string]int, g
 	}
 
 	subrouter := router.PathPrefix(spec.Proxy.ListenPath).Subrouter()
+
 	chainObj := gw.processSpec(spec, apisByListen, gs, subrouter, logrus.NewEntry(log))
 	if chainObj.Skip {
 		return chainObj.ThisHandler
@@ -693,7 +737,9 @@ func (gw *Gateway) loadHTTPService(spec *APISpec, apisByListen map[string]int, g
 		subrouter.Handle(rateLimitEndpoint, chainObj.RateLimitChain)
 	}
 
-	subrouter.NewRoute().Handler(chainObj.ThisHandler)
+	httpHandler := explicitRouteSubpaths(spec.Proxy.ListenPath, chainObj.ThisHandler, muxer, gwConfig.HttpServerOptions.EnableStrictRoutes)
+	subrouter.NewRoute().Handler(httpHandler)
+
 	return chainObj.ThisHandler
 }
 

@@ -18,16 +18,18 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/getkin/kin-openapi/openapi3"
+
 	"github.com/TykTechnologies/tyk/apidef/oas"
 
+	"github.com/TykTechnologies/graphql-go-tools/pkg/engine/resolve"
 	"github.com/cenk/backoff"
-	"github.com/jensneuse/graphql-go-tools/pkg/engine/resolve"
 
 	"github.com/Masterminds/sprig/v3"
 
 	circuit "github.com/TykTechnologies/circuitbreaker"
+	"github.com/TykTechnologies/graphql-go-tools/pkg/graphql"
 	"github.com/gorilla/mux"
-	"github.com/jensneuse/graphql-go-tools/pkg/graphql"
 	"github.com/sirupsen/logrus"
 
 	"github.com/TykTechnologies/gojsonschema"
@@ -76,6 +78,7 @@ const (
 	RequestTracked
 	RequestNotTracked
 	ValidateJSONRequest
+	ValidateRequestWithOAS
 	Internal
 	GoPlugin
 )
@@ -110,6 +113,7 @@ const (
 	StatusRequestTracked           RequestStatus = "Request Tracked"
 	StatusRequestNotTracked        RequestStatus = "Request Not Tracked"
 	StatusValidateJSON             RequestStatus = "Validate JSON"
+	StatusValidateRequest          RequestStatus = "Validate Request"
 	StatusInternal                 RequestStatus = "Internal path"
 	StatusGoPlugin                 RequestStatus = "Go plugin"
 )
@@ -141,6 +145,7 @@ type URLSpec struct {
 	TrackEndpoint             apidef.TrackEndpointMeta
 	DoNotTrackEndpoint        apidef.TrackEndpointMeta
 	ValidatePathMeta          apidef.ValidatePathMeta
+	ValidateRequest           apidef.ValidateRequestMeta
 	Internal                  apidef.InternalMeta
 	GoPluginMeta              GoPluginMiddleware
 
@@ -212,6 +217,16 @@ type APISpec struct {
 	} `json:"-"`
 }
 
+// GetSessionLifetimeRespectsKeyExpiration returns a boolean to tell whether session lifetime should respect to key expiration or not.
+// The global config takes the precedence. If the global one is `true`, value of the one in api level doesn't matter.
+func (a *APISpec) GetSessionLifetimeRespectsKeyExpiration() bool {
+	if a.GlobalConfig.SessionLifetimeRespectsKeyExpiration {
+		return true
+	}
+
+	return a.SessionLifetimeRespectsKeyExpiration
+}
+
 // Release releases all resources associated with API spec
 func (s *APISpec) Release() {
 	// release circuit breaker resources
@@ -234,6 +249,13 @@ func (s *APISpec) Release() {
 
 // Validate returns nil if s is a valid spec and an error stating why the spec is not valid.
 func (s *APISpec) Validate() error {
+	if s.IsOAS {
+		err := s.OAS.Validate(context.Background())
+		if err != nil {
+			return err
+		}
+	}
+
 	// For tcp services we need to make sure we can bind to the port.
 	switch s.Protocol {
 	case "tcp", "tls":
@@ -271,11 +293,13 @@ func (a APIDefinitionLoader) MakeSpec(def *apidef.APIDefinition, logger *logrus.
 	}
 
 	// new expiration feature
-	if t, err := time.Parse(apidef.ExpirationTimeFormat, def.Expiration); err != nil {
-		logger.WithError(err).WithField("name", def.Name).WithField("Expiration", def.Expiration).
-			Error("Could not parse expiration date for API")
-	} else {
-		def.ExpirationTs = t
+	if def.Expiration != "" {
+		if t, err := time.Parse(apidef.ExpirationTimeFormat, def.Expiration); err != nil {
+			logger.WithError(err).WithField("name", def.Name).WithField("Expiration", def.Expiration).
+				Error("Could not parse expiration date for API")
+		} else {
+			def.ExpirationTs = t
+		}
 	}
 
 	// Deprecated
@@ -368,6 +392,52 @@ func (a APIDefinitionLoader) MakeSpec(def *apidef.APIDefinition, logger *logrus.
 	return spec
 }
 
+// nestedApiDefinitionList is the response body for FromDashboardService
+type nestedApiDefinitionList struct {
+	Message []nestedApiDefinition
+	Nonce   string
+}
+
+type nestedApiDefinition struct {
+	*apidef.APIDefinition `json:"api_definition,inline"`
+	OAS                   *oas.OAS `json:"oas"`
+}
+
+func (f *nestedApiDefinitionList) set(defs []*apidef.APIDefinition) {
+	for _, def := range defs {
+		f.Message = append(f.Message, nestedApiDefinition{APIDefinition: def})
+	}
+}
+
+func (f *nestedApiDefinitionList) filter(enabled bool, tags ...string) []nestedApiDefinition {
+	if !enabled {
+		return f.Message
+	}
+
+	if len(tags) == 0 {
+		return nil
+	}
+
+	tagMap := map[string]bool{}
+	for _, tag := range tags {
+		tagMap[tag] = true
+	}
+
+	result := make([]nestedApiDefinition, 0, len(f.Message))
+	for _, v := range f.Message {
+		if v.TagsDisabled {
+			continue
+		}
+		for _, tag := range v.Tags {
+			if ok := tagMap[tag]; ok {
+				result = append(result, nestedApiDefinition{v.APIDefinition, v.OAS})
+				break
+			}
+		}
+	}
+	return result
+}
+
 // FromDashboardService will connect and download ApiDefintions from a Tyk Dashboard instance.
 func (a APIDefinitionLoader) FromDashboardService(endpoint string) ([]*APISpec, error) {
 	// Get the definitions
@@ -377,7 +447,9 @@ func (a APIDefinitionLoader) FromDashboardService(endpoint string) ([]*APISpec, 
 		log.Error("Failed to create request: ", err)
 	}
 
-	newRequest.Header.Set("authorization", a.Gw.GetConfig().NodeSecret)
+	gwConfig := a.Gw.GetConfig()
+
+	newRequest.Header.Set("authorization", gwConfig.NodeSecret)
 	log.Debug("Using: NodeID: ", a.Gw.GetNodeID())
 	newRequest.Header.Set(headers.XTykNodeID, a.Gw.GetNodeID())
 
@@ -405,49 +477,29 @@ func (a APIDefinitionLoader) FromDashboardService(endpoint string) ([]*APISpec, 
 	}
 
 	// Extract tagged APIs#
-	var list struct {
-		Message []struct {
-			ApiDefinition *apidef.APIDefinition `bson:"api_definition" json:"api_definition"`
-		}
-		Nonce string
-	}
+	list := &nestedApiDefinitionList{}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		body, _ := ioutil.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to decode body: %v body was: %v", err, string(body))
 	}
 
 	// Extract tagged entries only
-	apiDefs := make([]*apidef.APIDefinition, 0)
-
-	if a.Gw.GetConfig().DBAppConfOptions.NodeIsSegmented {
-		tagList := make(map[string]bool, len(a.Gw.GetConfig().DBAppConfOptions.Tags))
-		toLoad := make(map[string]*apidef.APIDefinition)
-
-		for _, mt := range a.Gw.GetConfig().DBAppConfOptions.Tags {
-			tagList[mt] = true
-		}
-
-		for _, apiEntry := range list.Message {
-			for _, t := range apiEntry.ApiDefinition.Tags {
-				if tagList[t] {
-					toLoad[apiEntry.ApiDefinition.APIID] = apiEntry.ApiDefinition
-				}
-			}
-		}
-
-		for _, apiDef := range toLoad {
-			apiDefs = append(apiDefs, apiDef)
-		}
-	} else {
-		for _, apiEntry := range list.Message {
-			apiDefs = append(apiDefs, apiEntry.ApiDefinition)
-		}
-	}
+	apiDefs := list.filter(gwConfig.DBAppConfOptions.NodeIsSegmented, gwConfig.DBAppConfOptions.Tags...)
 
 	// Process
 	var specs []*APISpec
 	for _, def := range apiDefs {
-		spec := a.MakeSpec(def, nil)
+		spec := a.MakeSpec(def.APIDefinition, nil)
+
+		if spec.IsOAS {
+			loader := openapi3.NewLoader()
+			if err := loader.ResolveRefsIn(&def.OAS.T, nil); err != nil {
+				log.WithError(err).Errorf("Dashboard loaded API's OAS reference resolve failed: %s", def.APIID)
+			}
+
+			spec.OAS = *def.OAS
+		}
+
 		specs = append(specs, spec)
 	}
 
@@ -497,16 +549,25 @@ func (a APIDefinitionLoader) FromRPC(orgId string, gw *Gateway) ([]*APISpec, err
 
 func (a APIDefinitionLoader) processRPCDefinitions(apiCollection string, gw *Gateway) ([]*APISpec, error) {
 
-	var apiDefs []*apidef.APIDefinition
-	if err := json.Unmarshal([]byte(apiCollection), &apiDefs); err != nil {
+	var payload []nestedApiDefinition
+	if err := json.Unmarshal([]byte(apiCollection), &payload); err != nil {
 		return nil, err
 	}
+
+	list := &nestedApiDefinitionList{
+		Message: payload,
+	}
+
+	gwConfig := a.Gw.GetConfig()
+
+	// Extract tagged entries only
+	apiDefs := list.filter(gwConfig.DBAppConfOptions.NodeIsSegmented, gwConfig.DBAppConfOptions.Tags...)
 
 	var specs []*APISpec
 	for _, def := range apiDefs {
 		def.DecodeFromDB()
 
-		if gw.GetConfig().SlaveOptions.BindToSlugsInsteadOfListenPaths {
+		if gwConfig.SlaveOptions.BindToSlugsInsteadOfListenPaths {
 			newListenPath := "/" + def.Slug //+ "/"
 			log.Warning("Binding to ",
 				newListenPath,
@@ -516,7 +577,16 @@ func (a APIDefinitionLoader) processRPCDefinitions(apiCollection string, gw *Gat
 			def.Proxy.ListenPath = newListenPath
 		}
 
-		spec := a.MakeSpec(def, nil)
+		spec := a.MakeSpec(def.APIDefinition, nil)
+		if spec.IsOAS {
+			loader := openapi3.NewLoader()
+			if err := loader.ResolveRefsIn(&def.OAS.T, nil); err != nil {
+				log.WithError(err).Errorf("RPC loaded API's OAS reference resolve failed: %s", def.APIID)
+			}
+
+			spec.OAS = *def.OAS
+		}
+
 		specs = append(specs, spec)
 	}
 
@@ -567,9 +637,10 @@ func (a APIDefinitionLoader) FromDir(dir string) []*APISpec {
 		_, _ = f.Seek(0, io.SeekStart)
 		_ = f.Close()
 
-		f, err = os.Open(a.GetOASFilepath(path))
+		loader := openapi3.NewLoader()
+		oasDoc, err := loader.LoadFromFile(a.GetOASFilepath(path))
 		if err == nil {
-			spec.OAS = a.ParseOAS(f)
+			spec.OAS.T = *oasDoc
 			_ = f.Close()
 		}
 
@@ -727,6 +798,10 @@ func (a APIDefinitionLoader) compileTransformPathSpec(paths []apidef.TemplateMet
 
 	log.Debug("Checking for transform paths...")
 	for _, stringSpec := range paths {
+		if stringSpec.Disabled {
+			continue
+		}
+
 		log.Debug("-- Generating path")
 		newSpec := URLSpec{}
 		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
@@ -866,24 +941,18 @@ func (a APIDefinitionLoader) compileCircuitBreakerPathSpec(paths []apidef.Circui
 
 		events := newSpec.CircuitBreaker.CB.Subscribe()
 		go func(path string, spec *APISpec, breakerPtr *circuit.Breaker) {
-			timerActive := false
 			for e := range events {
 				switch e {
 				case circuit.BreakerTripped:
 					log.Warning("[PROXY] [CIRCUIT BREAKER] Breaker tripped for path: ", path)
 					log.Debug("Breaker tripped: ", e)
-					// Start a timer function
 
-					if !timerActive {
-						go func(timeout int, breaker *circuit.Breaker) {
-							log.Debug("-- Sleeping for (s): ", timeout)
-							time.Sleep(time.Duration(timeout) * time.Second)
-							log.Debug("-- Resetting breaker")
-							breaker.Reset()
-							timerActive = false
-						}(newSpec.CircuitBreaker.ReturnToServiceAfter, breakerPtr)
-						timerActive = true
-					}
+					go func(timeout int, breaker *circuit.Breaker) {
+						log.Debug("-- Sleeping for (s): ", timeout)
+						time.Sleep(time.Duration(timeout) * time.Second)
+						log.Debug("-- Resetting breaker")
+						breaker.Reset()
+					}(newSpec.CircuitBreaker.ReturnToServiceAfter, breakerPtr)
 
 					if spec.Proxy.ServiceDiscovery.UseDiscoveryService {
 						if ServiceCache != nil {
@@ -899,8 +968,22 @@ func (a APIDefinitionLoader) compileCircuitBreakerPathSpec(paths []apidef.Circui
 						APIID:            spec.APIID,
 					})
 
+					spec.FireEvent(EventBreakerTripped, EventCurcuitBreakerMeta{
+						EventMetaDefault: EventMetaDefault{Message: "Breaker Tripped"},
+						CircuitEvent:     e,
+						Path:             path,
+						APIID:            spec.APIID,
+					})
+
 				case circuit.BreakerReset:
 					spec.FireEvent(EventBreakerTriggered, EventCurcuitBreakerMeta{
+						EventMetaDefault: EventMetaDefault{Message: "Breaker Reset"},
+						CircuitEvent:     e,
+						Path:             path,
+						APIID:            spec.APIID,
+					})
+
+					spec.FireEvent(EventBreakerReset, EventCurcuitBreakerMeta{
 						EventMetaDefault: EventMetaDefault{Message: "Breaker Reset"},
 						CircuitEvent:     e,
 						Path:             path,
@@ -1025,6 +1108,25 @@ func (a APIDefinitionLoader) compileValidateJSONPathspathSpec(paths []apidef.Val
 	return urlSpec
 }
 
+func (a APIDefinitionLoader) compileValidateRequestSpec(paths []apidef.ValidateRequestMeta, stat URLStatus, conf config.Config) []URLSpec {
+	var urlSpec []URLSpec
+
+	for _, stringSpec := range paths {
+		if !stringSpec.Enabled {
+			continue
+		}
+
+		newSpec := URLSpec{}
+		a.generateRegex(stringSpec.Path, &newSpec, stat, conf)
+		// Extend with method actions
+
+		newSpec.ValidateRequest = stringSpec
+		urlSpec = append(urlSpec, newSpec)
+	}
+
+	return urlSpec
+}
+
 func (a APIDefinitionLoader) compileUnTrackedEndpointPathspathSpec(paths []apidef.TrackEndpointMeta, stat URLStatus, conf config.Config) []URLSpec {
 	urlSpec := []URLSpec{}
 
@@ -1076,6 +1178,7 @@ func (a APIDefinitionLoader) getExtendedPathSpecs(apiVersionDef apidef.VersionIn
 	trackedPaths := a.compileTrackedEndpointPathspathSpec(apiVersionDef.ExtendedPaths.TrackEndpoints, RequestTracked, conf)
 	unTrackedPaths := a.compileUnTrackedEndpointPathspathSpec(apiVersionDef.ExtendedPaths.DoNotTrackEndpoints, RequestNotTracked, conf)
 	validateJSON := a.compileValidateJSONPathspathSpec(apiVersionDef.ExtendedPaths.ValidateJSON, ValidateJSONRequest, conf)
+	validateRequest := a.compileValidateRequestSpec(apiVersionDef.ExtendedPaths.ValidateRequest, ValidateRequestWithOAS, conf)
 	internalPaths := a.compileInternalPathspathSpec(apiVersionDef.ExtendedPaths.Internal, Internal, conf)
 	goPlugins := a.compileGopluginPathspathSpec(apiVersionDef.ExtendedPaths.GoPlugin, GoPlugin, apiSpec, conf)
 
@@ -1101,6 +1204,7 @@ func (a APIDefinitionLoader) getExtendedPathSpecs(apiVersionDef apidef.VersionIn
 	combinedPath = append(combinedPath, trackedPaths...)
 	combinedPath = append(combinedPath, unTrackedPaths...)
 	combinedPath = append(combinedPath, validateJSON...)
+	combinedPath = append(combinedPath, validateRequest...)
 	combinedPath = append(combinedPath, internalPaths...)
 
 	return combinedPath, len(whiteListPaths) > 0
@@ -1156,6 +1260,8 @@ func (a *APISpec) getURLStatus(stat URLStatus) RequestStatus {
 		return StatusRequestNotTracked
 	case ValidateJSONRequest:
 		return StatusValidateJSON
+	case ValidateRequestWithOAS:
+		return StatusValidateRequest
 	case Internal:
 		return StatusInternal
 	case GoPlugin:
@@ -1374,6 +1480,10 @@ func (a *APISpec) CheckSpecMatchesStatus(r *http.Request, rxPaths []URLSpec, mod
 			if method == rxPaths[i].ValidatePathMeta.Method {
 				return true, &rxPaths[i].ValidatePathMeta
 			}
+		case ValidateRequestWithOAS:
+			if method == rxPaths[i].ValidateRequest.Method {
+				return true, &rxPaths[i].ValidateRequest
+			}
 		case Internal:
 			if method == rxPaths[i].Internal.Method {
 				return true, &rxPaths[i].Internal
@@ -1544,7 +1654,7 @@ func (a *APISpec) Version(r *http.Request) (*apidef.VersionInfo, RequestStatus) 
 }
 
 func (a *APISpec) StripListenPath(r *http.Request, path string) string {
-	return stripListenPath(a.Proxy.ListenPath, path, mux.Vars(r))
+	return stripListenPath(a.Proxy.ListenPath, path)
 }
 
 func (a *APISpec) SanitizeProxyPaths(r *http.Request) {
@@ -1575,9 +1685,7 @@ func (r *RoundRobin) WithLen(len int) int {
 	return int(cur) % len
 }
 
-var listenPathVarsRE = regexp.MustCompile(`{[^:]+(:[^}]+)?}`)
-
-func stripListenPath(listenPath, path string, muxVars map[string]string) (res string) {
+func stripListenPath(listenPath, path string) (res string) {
 	defer func() {
 		if !strings.HasPrefix(res, "/") {
 			res = "/" + res
@@ -1589,13 +1697,11 @@ func stripListenPath(listenPath, path string, muxVars map[string]string) (res st
 		return
 	}
 
-	lp := listenPathVarsRE.ReplaceAllStringFunc(listenPath, func(match string) string {
-		match = strings.TrimLeft(match, "{")
-		match = strings.TrimRight(match, "}")
-		aliasVar := strings.Split(match, ":")[0]
-		return muxVars[aliasVar]
-	})
-
-	res = strings.TrimPrefix(path, lp)
-	return
+	tmp := new(mux.Route).PathPrefix(listenPath)
+	s, err := tmp.GetPathRegexp()
+	if err != nil {
+		return path
+	}
+	reg := regexp.MustCompile(s)
+	return reg.ReplaceAllString(path, "")
 }

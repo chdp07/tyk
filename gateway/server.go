@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"github.com/TykTechnologies/tyk/test"
 	"html/template"
 	"io/ioutil"
 	stdlog "log"
@@ -29,6 +30,7 @@ import (
 	gas "github.com/TykTechnologies/goautosocket"
 	"github.com/TykTechnologies/gorpc"
 	"github.com/TykTechnologies/goverify"
+	"github.com/TykTechnologies/tyk-pump/serializer"
 	logstashHook "github.com/bshuster-repo/logrus-logstash-hook"
 	"github.com/evalphobia/logrus_sentry"
 	graylogHook "github.com/gemnasium/logrus-graylog-hook"
@@ -183,6 +185,8 @@ type Gateway struct {
 	hostDetails     hostDetails
 
 	healthCheckInfo atomic.Value
+
+	dialCtxFn test.DialContext
 }
 
 type hostDetails struct {
@@ -350,14 +354,19 @@ func (gw *Gateway) setupGlobals() {
 		go redisPurger.PurgeLoop(gw.ctx)
 
 		if gw.GetConfig().AnalyticsConfig.Type == "rpc" {
-			mainLog.Debug("Using RPC cache purge")
+			if gw.GetConfig().AnalyticsConfig.SerializerType == serializer.PROTOBUF_SERIALIZER {
+				mainLog.Error("Protobuf analytics serialization is not supported with rpc analytics.")
+			} else {
+				mainLog.Debug("Using RPC cache purge")
 
-			store := storage.RedisCluster{KeyPrefix: "analytics-", IsAnalytics: true, RedisController: gw.RedisController}
-			purger := rpc.Purger{
-				Store: &store,
+				store := storage.RedisCluster{KeyPrefix: "analytics-", IsAnalytics: true, RedisController: gw.RedisController}
+				purger := rpc.Purger{
+					Store: &store,
+				}
+				purger.Connect()
+				go purger.PurgeLoop(gw.ctx, time.Duration(gw.GetConfig().AnalyticsConfig.PurgeInterval))
 			}
-			purger.Connect()
-			go purger.PurgeLoop(gw.ctx, time.Duration(gw.GetConfig().AnalyticsConfig.PurgeInterval))
+
 		}
 		go gw.flushNetworkAnalytics(gw.ctx)
 	}
@@ -471,7 +480,7 @@ func (gw *Gateway) syncAPISpecs() (int, error) {
 	var filter []*APISpec
 	for _, v := range s {
 		if err := v.Validate(); err != nil {
-			mainLog.Infof("Skipping loading spec:%q because it failed validation with error:%v", v.Name, err)
+			mainLog.WithError(err).WithField("spec", v.Name).Error("Skipping loading spec because it failed validation")
 			continue
 		}
 		filter = append(filter, v)
@@ -609,15 +618,20 @@ func (gw *Gateway) loadControlAPIEndpoints(muxer *mux.Router) {
 		r.HandleFunc("/org/keys/{keyName:[^/]*}", gw.orgHandler).Methods("POST", "PUT", "GET", "DELETE")
 		r.HandleFunc("/keys/policy/{keyName}", gw.policyUpdateHandler).Methods("POST")
 		r.HandleFunc("/keys/create", gw.createKeyHandler).Methods("POST")
-		r.HandleFunc("/apis", gw.apiHandler).Methods("GET", "POST", "PUT", "DELETE")
+		r.HandleFunc("/apis", gw.apiHandler).Methods(http.MethodGet)
+		r.HandleFunc("/apis", gw.blockInDashboardMode(gw.apiHandler)).Methods(http.MethodPost)
 		r.HandleFunc("/apis/oas", gw.apiOASGetHandler).Methods(http.MethodGet)
-		r.HandleFunc("/apis/oas", gw.apiOASPostHandler).Methods(http.MethodPost)
-		r.HandleFunc("/apis/{apiID}", gw.apiHandler).Methods("GET", "POST", "PUT", "DELETE")
+		r.HandleFunc("/apis/oas", gw.blockInDashboardMode(gw.validateOAS(gw.apiOASPostHandler))).Methods(http.MethodPost)
+		r.HandleFunc("/apis/{apiID}", gw.apiHandler).Methods(http.MethodGet)
+		r.HandleFunc("/apis/{apiID}", gw.blockInDashboardMode(gw.apiHandler)).Methods(http.MethodPost)
+		r.HandleFunc("/apis/{apiID}", gw.blockInDashboardMode(gw.apiHandler)).Methods(http.MethodPut)
+		r.HandleFunc("/apis/{apiID}", gw.apiHandler).Methods(http.MethodDelete)
 		r.HandleFunc("/apis/oas/export", gw.apiOASExportHandler).Methods("GET")
+		r.HandleFunc("/apis/oas/import", gw.blockInDashboardMode(gw.validateOAS(gw.makeImportedOASTykAPI(gw.apiOASPostHandler)))).Methods(http.MethodPost)
 		r.HandleFunc("/apis/oas/{apiID}", gw.apiOASGetHandler).Methods(http.MethodGet)
-		r.HandleFunc("/apis/oas/{apiID}", gw.apiOASPutHandler).Methods(http.MethodPut)
-		r.HandleFunc("/apis/oas/{apiID}", gw.apiHandler).Methods(http.MethodDelete)
-		r.HandleFunc("/apis/oas/{apiID}", gw.validateOAS(gw.apiOASPatchHandler)).Methods(http.MethodPatch)
+		r.HandleFunc("/apis/oas/{apiID}", gw.blockInDashboardMode(gw.validateOAS(gw.apiOASPutHandler))).Methods(http.MethodPut)
+		r.HandleFunc("/apis/oas/{apiID}", gw.blockInDashboardMode(gw.validateOAS(gw.apiOASPatchHandler))).Methods(http.MethodPatch)
+		r.HandleFunc("/apis/oas/{apiID}", gw.blockInDashboardMode(gw.apiHandler)).Methods(http.MethodDelete)
 		r.HandleFunc("/apis/oas/{apiID}/export", gw.apiOASExportHandler).Methods("GET")
 		r.HandleFunc("/health", gw.healthCheckhandler).Methods("GET")
 		r.HandleFunc("/policies", gw.polHandler).Methods("GET", "POST", "PUT", "DELETE")
